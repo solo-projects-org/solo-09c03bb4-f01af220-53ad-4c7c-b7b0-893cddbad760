@@ -3,16 +3,19 @@
 工作流
 ------
 1. ``POST /api/grid``  定义固定方片网格；
-2. ``POST /api/batches``  整批换片：先做单片几何校验与批内缝校验，
-   接不上直接 422 并指出接缝，事务回滚、旧图继续有效；
+2. ``POST /api/batches``  整批换片：先做单片几何校验与批内缝校验（不加锁，
+   无关换片不必等待），再在写事务内现读邻片接缝端点索引，按“整批换完后的图”
+   验本批触及的全部内缝；接不上直接 422 并指出两侧片号与端点坐标，
+   事务回滚、旧图继续有效；
 3. ``GET /api/render``  按当前整图快照接图，输出端点位于图幅外边的长线或闭环，
-   同时核对新片与未换旧片之间的批界缝；
+   并复核全图接缝（含对侧尚未交片时留下的单侧端点）；
 4. 出图只在单个只读事务内取快照，换片写入不等待出图，正在出图的请求继续用原版。
 """
 
 from __future__ import annotations
 
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -22,7 +25,7 @@ from fastapi.responses import JSONResponse
 from . import seed
 from .assembly import assemble
 from .db import Database
-from .geometry import Grid, validate_batch
+from .geometry import Grid, validate_batch, validate_boundary_seams
 from .schemas import BatchIn, GridIn, RenderOut
 
 
@@ -35,6 +38,91 @@ def build_grid(db: Database, conn) -> Grid:
     if meta is None:
         raise HTTPException(status_code=409, detail="尚未定义网格，请先调用 POST /api/grid")
     return Grid(meta["rows"], meta["cols"], meta["tile_size"])
+
+
+def _rejected_response(db: Database, conn, tile_count: int,
+                       reason: str | None, errors: list[dict]) -> JSONResponse:
+    """在同一事务内记录被拒绝的批次并返回 422（当前图幅不变）。"""
+    rejected_id = db.record_rejected_batch(
+        conn, tile_count=tile_count, reason=reason, errors=errors
+    )
+    conn.commit()
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "rejected",
+            "batch_id": rejected_id,
+            "message": "验缝未通过，整批拒绝，当前图幅仍使用旧图",
+            "error_count": len(errors),
+            "errors": errors,
+        },
+    )
+
+
+def execute_batch_submission(
+    db: Database, payload: list[dict], reason: str | None
+) -> dict | JSONResponse:
+    """整批换片的核心流程（路由与自测共用）。
+
+    阶段一（不加写锁）：网格/片号范围、单片几何、批内缝校验——
+        无关换片不必等本批做完这些检查；
+    阶段二（``BEGIN IMMEDIATE`` 写事务）：现读邻片接缝端点索引，
+        按整批换完后的图验本批触及的批界缝——
+        不会按过期的邻片状态放行，也不会仅因无关片先入库而被拒；
+        通过则整批提交（折线版本 + 端点索引同一事务）。
+    """
+    with db.connect() as conn:
+        grid = build_grid(db, conn)
+        # 片号范围校验
+        for t in payload:
+            if not (0 <= t["row"] < grid.rows and 0 <= t["col"] < grid.cols):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "tile_out_of_grid",
+                        "message": f"片 ({t['row']},{t['col']}) 超出 {grid.rows}x{grid.cols} 网格",
+                    },
+                )
+        # 阶段一：单片几何 + 批内缝（只读本批提交数据，不读库中任何旧片）
+        all_endpoints, errors = validate_batch(grid, payload)
+        if errors:
+            return _rejected_response(db, conn, len(payload), reason, errors)
+
+        batch_endpoints: dict[tuple[int, int], list] = {}
+        for ep in all_endpoints:
+            batch_endpoints.setdefault(ep.tile, []).append(ep)
+
+        # 阶段二：写事务内现读邻片端点索引，验批界缝
+        neighbor_ids = set()
+        for row, col in batch_endpoints:
+            for edge in ("bottom", "left", "right", "top"):
+                nbr = grid.neighbor_across(row, col, edge)
+                if nbr is not None and nbr not in batch_endpoints:
+                    neighbor_ids.add(nbr)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            raise HTTPException(status_code=409, detail="另一批换片正在提交，请稍后重试")
+        try:
+            neighbor_endpoints = db.load_seam_endpoints(conn, neighbor_ids)
+            seam_errors = validate_boundary_seams(
+                grid, batch_endpoints, neighbor_endpoints
+            )
+            if seam_errors:
+                return _rejected_response(
+                    db, conn, len(payload), reason, seam_errors
+                )
+            batch_id = db.commit_batch(conn, payload, reason)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {
+        "status": "committed",
+        "batch_id": batch_id,
+        "tile_count": len(payload),
+        "message": "换片已生效，可调用 GET /api/render 出图",
+    }
 
 
 @asynccontextmanager
@@ -82,7 +170,9 @@ def define_grid(body: GridIn, db: Database = Depends(get_db)) -> dict:
                 "application/json": {
                     "examples": {
                         "合格样例-上排修测": {"value": seed.GOOD_BATCH},
+                        "合格样例-两侧一起换": {"value": seed.PAIR_GOOD_BATCH},
                         "失败样例-接缝对不上": {"value": seed.BAD_BATCH},
+                        "失败样例-单侧换片错缝": {"value": seed.SINGLE_SIDE_BAD_BATCH},
                     }
                 }
             }
@@ -91,50 +181,16 @@ def define_grid(body: GridIn, db: Database = Depends(get_db)) -> dict:
 )
 def submit_batch(body: BatchIn, db: Database = Depends(get_db)) -> dict:
     payload = [t.model_dump() for t in body.tiles]
-    with db.connect() as conn:
-        grid = build_grid(db, conn)
-        # 片号范围与重复校验
-        for t in payload:
-            if not (0 <= t["row"] < grid.rows and 0 <= t["col"] < grid.cols):
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "code": "tile_out_of_grid",
-                        "message": f"片 ({t['row']},{t['col']}) 超出 {grid.rows}x{grid.cols} 网格",
-                    },
-                )
-        # 整批验缝：只读本批提交数据，不读未换片折线明细
-        _, errors = validate_batch(grid, payload)
-        if errors:
-            rejected_id = db.record_rejected_batch(
-                conn, tile_count=len(payload), reason=body.reason, errors=errors
-            )
-            conn.commit()
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "status": "rejected",
-                    "batch_id": rejected_id,
-                    "message": "验缝未通过，整批拒绝，当前图幅仍使用旧图",
-                    "error_count": len(errors),
-                    "errors": errors,
-                },
-            )
-        batch_id = db.commit_batch(conn, payload, body.reason)
-        conn.commit()
-    return {
-        "status": "committed",
-        "batch_id": batch_id,
-        "tile_count": len(payload),
-        "message": "换片已生效，可调用 GET /api/render 出图",
-    }
+    return execute_batch_submission(db, payload, body.reason)
 
 
 @app.get("/api/render", tags=["出图"], summary="接图：外边长线或闭环", response_model=RenderOut)
 def render(db: Database = Depends(get_db)) -> dict[str, Any]:
     # 单个只读事务 = 一致快照；并发换片不会影响本次出图（正在出图继续用原版）
     with db.connect() as conn:
+        conn.execute("BEGIN")
         snapshot = db.current_snapshot(conn)
+        conn.commit()
     meta = snapshot["grid"]
     if meta is None:
         raise HTTPException(status_code=409, detail="尚未定义网格")

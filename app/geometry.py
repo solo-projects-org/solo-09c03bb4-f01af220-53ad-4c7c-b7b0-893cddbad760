@@ -16,6 +16,9 @@ from typing import Iterable
 # 边名：下、左、右、上
 EDGES = ("bottom", "left", "right", "top")
 
+# 隔缝相对的边
+OPPOSITE_EDGE = {"bottom": "top", "top": "bottom", "left": "right", "right": "left"}
+
 
 @dataclass(frozen=True)
 class Grid:
@@ -224,12 +227,12 @@ def validate_tile_polylines(
 def validate_batch(
     grid: Grid, tiles: list[dict]
 ) -> tuple[list[SeamEndpoint], list[dict]]:
-    """整批验缝（只依据本批提交数据，不读取未换片的任何折线明细）。
+    """批内验缝（只依据本批提交数据，不读取库中任何旧片数据）。
 
     规则：
       * 批内两片之间的内缝，同一 (位置, 水深) 的端点两侧必须各有且仅有一个；
-      * 图幅外边、以及本批与未换片之间的批界缝上允许只留单侧端点
-        （对侧情况由出图阶段结合当前整图版本核对）。
+      * 图幅外边允许留端点；本批与库中旧片之间的批界缝不在此验，
+        由 ``validate_boundary_seams`` 结合当前图幅端点索引核对。
     """
     all_endpoints: list[SeamEndpoint] = []
     errors: list[dict] = []
@@ -256,8 +259,7 @@ def validate_batch(
         buckets.setdefault(key, []).append(ep)
 
     # 枚举本批内部所有接缝签名（两侧片都在本批），逐一核对两侧端点。
-    # 不查询未换片的任何数据；批界缝（一侧未换）只允许单侧端点，留到出图核对。
-    tile_index = {(t["row"], t["col"]): t for t in tiles}
+    # 不查询库中旧片的任何数据；批界缝由 validate_boundary_seams 核对。
     internal_seam_keys: set[tuple] = set()
     for (row, col) in tile_ids:
         for edge, nbr in (
@@ -278,6 +280,10 @@ def validate_batch(
             for k, eps in buckets.items()
             if k[0] == kind and k[1] == a and k[2] == b
         ]
+        # 缝两侧的片号
+        seam_tiles = (
+            [(a, b), (a, b + 1)] if kind == "v" else [(a, b), (a + 1, b)]
+        )
         for key, eps in related:
             x, y, depth = key[3], key[4], key[5]
             sides = {ep.tile for ep in eps}
@@ -289,14 +295,92 @@ def validate_batch(
                 {
                     "code": "seam_count_mismatch",
                     "message": (
-                        f"内缝 {kind}({a},{b}) 上 ({x},{y}) 水深 {depth} "
-                        f"的端点数量为 {len(eps)}（来自 {sorted(sides)} 片），两侧须各有一个"
+                        f"内缝 {kind}({a},{b}) 片 {seam_tiles[0]} 与片 {seam_tiles[1]} 之间："
+                        f"({x},{y}) 水深 {depth} 的端点数量为 {len(eps)}"
+                        f"（来自 {sorted(sides)} 片），两侧须各有一个"
                     ),
                     "seam": [kind, a, b],
                     "point": [x, y],
                     "depth": depth,
-                    "tiles": [list(t) for t in sorted(sides)],
+                    "tiles": [list(t) for t in seam_tiles],
+                    "present_on": [list(t) for t in sorted(sides)],
                 }
             )
 
     return all_endpoints, errors
+
+
+def validate_boundary_seams(
+    grid: Grid,
+    batch_endpoints: dict[tuple[int, int], list[SeamEndpoint]],
+    neighbor_endpoints: dict[tuple[int, int], list[SeamEndpoint]],
+) -> list[dict]:
+    """按“整批换完后的图”验本批触及的批界缝（本批片 ↔ 已交未换片）。
+
+    * ``batch_endpoints``：本批各片的新端点（键为片号）；
+    * ``neighbor_endpoints``：当前图幅中、不在本批内的邻片端点索引
+      （只含内缝端点摘要，不含折线明细）；键集合即“对侧已交片”的片号。
+    * 批内缝（两侧都在本批）由 ``validate_batch`` 验过，此处跳过；
+    * 对侧尚未交片的缝跳过——端点可先留，等对侧交片那一批再核对；
+    * 两侧都已交片的缝：同一 (位置, 水深) 的端点两侧必须各有且仅有一个。
+      本批删掉旧端点而邻片仍留有对应端点时，同样在此被拦下。
+
+    单片几何校验已保证每片每条边上同一 (位置, 水深) 至多一个端点，
+    因此这里按集合比较即可。错误指明两侧片号与端点坐标。
+    """
+    errors: list[dict] = []
+    checked: set[tuple] = set()
+
+    def mismatch(kind: str, a: int, b: int, x: int, y: int, depth: int,
+                 tile: tuple[int, int], nbr: tuple[int, int],
+                 present: tuple[int, int]) -> None:
+        errors.append(
+            {
+                "code": "seam_count_mismatch",
+                "message": (
+                    f"内缝 {kind}({a},{b}) 片 {tile} 与片 {nbr} 之间："
+                    f"端点 ({x},{y}) 水深 {depth} 仅片 {present} 一侧有，"
+                    f"同位置同水深的端点两侧须各有一个"
+                ),
+                "seam": [kind, a, b],
+                "point": [x, y],
+                "depth": depth,
+                "tiles": [list(t) for t in sorted((tile, nbr))],
+                "present_on": [list(present)],
+            }
+        )
+
+    for tile_id in sorted(batch_endpoints):
+        row, col = tile_id
+        for edge in EDGES:
+            seam = grid.seam_of_edge(row, col, edge)
+            if seam is None:
+                continue  # 图幅外边，允许留端点
+            nbr = grid.neighbor_across(row, col, edge)
+            assert nbr is not None
+            if nbr in batch_endpoints:
+                continue  # 批内缝，validate_batch 已验
+            kind, (a, b) = seam
+            if (kind, a, b) in checked:
+                continue
+            checked.add((kind, a, b))
+            if nbr not in neighbor_endpoints:
+                continue  # 对侧还没交片：可先留端点，等对侧交片再核对
+            own_keys = {
+                (ep.x, ep.y, ep.depth)
+                for ep in batch_endpoints[tile_id]
+                if ep.edge == edge
+            }
+            opp = OPPOSITE_EDGE[edge]
+            other_keys = {
+                (ep.x, ep.y, ep.depth)
+                for ep in neighbor_endpoints[nbr]
+                if ep.edge == opp
+            }
+            for x, y, depth in sorted(own_keys - other_keys):
+                mismatch(kind, a, b, x, y, depth, tile_id, nbr, tile_id)
+            for x, y, depth in sorted(other_keys - own_keys):
+                mismatch(kind, a, b, x, y, depth, tile_id, nbr, nbr)
+
+    errors.sort(key=lambda e: (e["seam"], e["point"], e["depth"]))
+    return errors

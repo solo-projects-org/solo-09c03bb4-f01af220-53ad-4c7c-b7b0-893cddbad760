@@ -10,11 +10,13 @@ FastAPI + SQLite（WAL）实现，支持整批换片、验缝、出图拼接与�
 | 矩形图幅按固定方片网格划分，整数坐标 | `app/geometry.py` `Grid`；`POST /api/grid` 一次性定义，有数据后不可改 |
 | 每片提交带水深的整数坐标折线 | `app/schemas.py` `PolylineIn`（非整数坐标在 Pydantic 层拒绝） |
 | 折线两端落在片边、避开角点，其余点严格在片内 | `validate_tile_polylines`：`endpoint_not_on_edge` / `interior_point_on_edge` |
-| 内缝同一水深、同一位置端点两侧各一个；外边可留端点 | `validate_batch`：只枚举本批两侧都换的内缝，按 `(缝, 位置, 水深)` 配对，错误码 `seam_count_mismatch` |
-| 按整批换完的图验缝，**不读未换片折线明细** | 验缝只入参本批 `tiles` + 静态网格；批界缝单侧端点放行，留到出图核对 |
-| 接不上指出接缝，换片失败继续用旧图 | 失败返回 HTTP 422 + 接缝坐标/片号/水深，事务回滚；`batches` 表留 `rejected` 审计记录 |
+| 内缝同一水深、同一位置端点两侧各一个 | 批内缝：`validate_batch`；批界缝：`validate_boundary_seams` 按 `(位置, 水深)` 集合与邻片比对，错误码 `seam_count_mismatch`；本批删掉旧端点同样会被邻侧比对出来 |
+| 按整批换完的图验缝，只验本批触及的内缝 | `POST /api/batches` 两阶段：先做单片几何与批内缝校验（不加锁），再在写事务内现读邻片**接缝端点索引**验批界缝；两侧都已交片才验，对侧未交片可暂留端点 |
+| 日常换片不读未换片的折线明细 | 验缝只查 `tile_seam_endpoints`（当前各片内缝端点的派生摘要），不 SELECT `tile_revisions`；索引随换片事务原子更新 |
+| 接不上指出接缝，换片失败继续用旧图 | 失败返回 HTTP 422 + 两侧片号/端点坐标/水深，整批不生效；`batches` 表留 `rejected` 审计记录 |
 | 出图接成两端位于图幅外边的长线或闭环，每条原折线恰用一次 | `app/assembly.py` 半边图行走；`used == edges` 自检断言保证不重不漏 |
 | 换片不等旧图出完，正在出图的请求继续用原版 | SQLite WAL + 单读事务快照，出图期间提交的换片不影响本次结果（见 `tests/test_concurrency.py`） |
+| 并发换片不按过期邻片状态放行；无关换片互不阻塞、互不牵连 | 批界缝校验在 `BEGIN IMMEDIATE` 写事务内现读索引（拿到写锁后读到的必是最新已提交状态）；单片检查在加锁前完成，写锁只覆盖验缝与写入；无关批验缝互不影响 |
 
 坐标约定：`x` 向右、`y` 向上；片号 `(row, col)`，`row` 自下而上、`col` 自左而右，均从 0 开始。
 
@@ -22,13 +24,13 @@ FastAPI + SQLite（WAL）实现，支持整批换片、验缝、出图拼接与�
 
 ```
 app/
-  main.py       FastAPI 路由与事务边界
-  geometry.py   网格、单片几何校验、整批验缝
-  assembly.py   整图接图（长线/闭环）与批界缝核对
-  db.py         SQLite 持久层（WAL、版本化、快照读）
+  main.py       FastAPI 路由与事务边界（两阶段换片：无锁单片检查 → 写事务内验批界缝）
+  geometry.py   网格、单片几何校验、批内缝与批界缝验缝
+  assembly.py   整图接图（长线/闭环）与全图接缝复核
+  db.py         SQLite 持久层（WAL、版本化、端点索引、快照读、user_version 迁移）
   schemas.py    Pydantic 模型
   seed.py       Swagger 演示数据（2x2：2 条长线 + 1 个菱形闭环）
-tests/          32 个 pytest 用例
+tests/          47 个 pytest 用例
 Dockerfile, docker-compose.yml, requirements*.txt
 ```
 
@@ -46,8 +48,11 @@ docker compose up --build
 1. `POST /admin/seed` —— 一键载入 2x2 演示图幅（清空重建，仅演示用）。
 2. `GET /api/render` —— 出图：水深 3、5 各一条横贯图幅的长线，水深 10 一个跨四片闭环。
 3. `POST /api/batches` —— 请求体下拉选择内置示例：
-   * **合格样例-上排修测**：只换上排两片，批内缝匹配、批界缝沿用旧端点，返回 200；
-   * **失败样例-接缝对不上**：竖缝上水深 3 端点两侧位置不一致，返回 422 并指出接缝，旧图不变。
+   * **合格样例-上排修测**：只换 row 0 两片，批内缝匹配、批界缝沿用旧端点，返回 200；
+   * **合格样例-两侧一起换**：竖缝新端点 (100,25) 两侧同批提交，返回 200，出图正常；
+   * **失败样例-接缝对不上**：批内竖缝上水深 3 端点两侧位置不一致，返回 422；
+   * **失败样例-单侧换片错缝**：只换 (0,0)，新端点与未换的 (0,1) 旧端点对不上，
+     返回 422 并指出两侧片号与端点坐标（配对的“两侧一起换”样例可对照通过）。
 4. `GET /api/tiles` —— 各片当前版本（只给条数与批次号，**不返回折线明细**）。
 5. `GET /api/batches` —— 全部换批记录，含被拒绝批次的接缝错误。
 
@@ -56,22 +61,34 @@ curl 速览：
 ```bash
 curl -X POST localhost:8000/admin/seed
 curl localhost:8000/api/render | jq
+# 单侧错缝：只换 (0,0)，竖缝端点挪到 (100,25)，与未换的 (0,1) 对不上 -> 422
 curl -X POST localhost:8000/api/batches -H 'Content-Type: application/json' \
-  -d '{"tiles":[{"row":0,"col":0,"polylines":[{"depth":3,"points":[[0,20],[50,30],[100,20]]}]},
-               {"row":0,"col":1,"polylines":[{"depth":3,"points":[[100,25],[150,20],[200,20]]}]}]}'
-# -> 422，errors 中给出 seam=["v",0,0]、point、depth、两侧片号
+  -d '{"tiles":[{"row":0,"col":0,"polylines":[{"depth":3,"points":[[0,20],[50,30],[100,25]]},
+                 {"depth":10,"points":[[30,100],[40,70],[70,55],[100,70]]}]}]}'
+# -> 422，errors 中给出 seam=["v",0,0]、point、depth、两侧片号 [[0,0],[0,1]]
+# 两侧一起换：竖缝新端点两侧一致 -> 200，出图正常
+curl -X POST localhost:8000/api/batches -H 'Content-Type: application/json' \
+  -d '{"tiles":[{"row":0,"col":0,"polylines":[{"depth":3,"points":[[0,20],[50,30],[100,25]]},
+                 {"depth":10,"points":[[30,100],[40,70],[70,55],[100,70]]}]},
+                {"row":0,"col":1,"polylines":[{"depth":3,"points":[[100,25],[160,18],[200,20]]},
+                 {"depth":10,"points":[[100,70],[140,80],[170,100]]}]}]}'
+curl localhost:8000/api/render | jq
 ```
 
 ## 5. 出图结果说明
 
 `GET /api/render` 返回：
 
-* `status`：`ok` 或 `seam_errors`（新片与未换旧片在批界缝接不上时）；
+* `status`：`ok` 或 `seam_errors`；
 * `features[]`：`depth`、`closed`、`points`、`source_tiles`；
   * 长线 `closed=false`，首尾点必在图幅外边；
   * 闭环 `closed=true`，点序列首尾重复表示闭合；
 * `seam_errors[]`：接不上的节点，含坐标、水深、涉及片号（`seam_dangling` / `seam_collision` / `outer_endpoint_conflict`）。
   即便有错也会返回可拼接部分，且不丢任何原折线。
+
+换片入库前已按“整批换完后的图”验过本批触及的全部内缝，因此已交片之间
+不会带着错缝入库；`seam_errors` 只可能出现在**对侧尚未交片**的缝上
+（端点按规则暂留，等对侧交片那一批再核对），出图在此处充当复核兜底。
 
 ## 6. 本地开发与自测
 
@@ -87,6 +104,13 @@ uvicorn app.main:app --reload
 * `grid_meta`：唯一网格定义；
 * `batches`：换批记录，`status` 为 `committed` / `rejected`，拒绝时存错误 JSON；
 * `tile_revisions`：折线版本表，**只增不删**；
-* `current_tiles`：每片当前指向的批次版本（UPSERT）。
+* `current_tiles`：每片当前指向的批次版本（UPSERT）；
+* `tile_seam_endpoints`：当前各片**内缝端点索引**（派生摘要，非折线明细），
+  随换片事务原子重建，供验缝查询。
 
 换片在单事务内完成：任一片写入失败或进程中断，整批回滚，当前版本指针不变。
+
+库结构版本由 `PRAGMA user_version` 管理：v1 为初始结构，v2 增加
+`tile_seam_endpoints`。旧库打开时自动迁移——按 `current_tiles` 指向的当前
+版本回填端点索引，图幅数据与换片历史全部保留，旧片不必重交
+（见 `tests/test_migration.py`）。
